@@ -17,6 +17,7 @@
  */
 struct Database;
 struct Iterator;
+struct Snapshot;
 static void iterator_end_do (napi_env env, Iterator* iterator, napi_value cb);
 
 /**
@@ -30,6 +31,10 @@ static void iterator_end_do (napi_env env, Iterator* iterator, napi_value cb);
 #define NAPI_ITERATOR_CONTEXT() \
   Iterator* iterator = NULL; \
   NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], (void**)&iterator));
+
+#define NAPI_SNAPSHOT_CONTEXT() \
+  Snapshot* snapshot = NULL; \
+  NAPI_STATUS_THROWS(napi_get_value_external(env, argv[0], (void**)&snapshot));
 
 #define NAPI_BATCH_CONTEXT() \
   Batch* batch = NULL; \
@@ -358,6 +363,7 @@ struct Database {
       blockCache_(NULL),
       filterPolicy_(leveldb::NewBloomFilterPolicy(10)),
       currentIteratorId_(0),
+      currentSnapshotId_(0),
       pendingCloseWorker_(NULL),
       priorityWork_(0) {}
 
@@ -441,6 +447,16 @@ struct Database {
     DecrementPriorityWork();
   }
 
+  void AttachSnapshot (uint32_t id, Snapshot* snapshot) {
+    snapshots_[id] = snapshot;
+    // IncrementPriorityWork();
+  }
+
+  void DetachSnapshot (uint32_t id) {
+    snapshots_.erase(id);
+    // DecrementPriorityWork();
+  }
+
   void IncrementPriorityWork () {
     ++priorityWork_;
   }
@@ -461,8 +477,10 @@ struct Database {
   leveldb::Cache* blockCache_;
   const leveldb::FilterPolicy* filterPolicy_;
   uint32_t currentIteratorId_;
+  uint32_t currentSnapshotId_;
   BaseWorker *pendingCloseWorker_;
   std::map< uint32_t, Iterator * > iterators_;
+  std::map< uint32_t, Snapshot * > snapshots_;
 
 private:
   uint32_t priorityWork_;
@@ -510,7 +528,8 @@ struct Iterator {
             bool fillCache,
             bool keyAsBuffer,
             bool valueAsBuffer,
-            uint32_t highWaterMark)
+            uint32_t highWaterMark,
+            const leveldb::Snapshot* snapshot)
     : database_(database),
       id_(id),
       reverse_(reverse),
@@ -534,7 +553,13 @@ struct Iterator {
       ref_(NULL) {
     options_ = new leveldb::ReadOptions();
     options_->fill_cache = fillCache;
-    options_->snapshot = database->NewSnapshot();
+    if (snapshot) {
+      options_->snapshot = snapshot;
+      sharedSnapshot_ = true;
+    } else {
+      options_->snapshot = database->NewSnapshot();
+      sharedSnapshot_ = false;
+    }
   }
 
   ~Iterator () {
@@ -565,7 +590,9 @@ struct Iterator {
   void IteratorEnd () {
     delete dbIterator_;
     dbIterator_ = NULL;
-    database_->ReleaseSnapshot(options_->snapshot);
+    if (!sharedSnapshot_) {
+      database_->ReleaseSnapshot(options_->snapshot);
+    }
   }
 
   void CheckEndCallback () {
@@ -708,6 +735,51 @@ struct Iterator {
 
   leveldb::ReadOptions* options_;
   BaseWorker* endWorker_;
+  bool sharedSnapshot_;
+
+private:
+  napi_ref ref_;
+};
+
+/**
+ * Owns a leveldb snapshot.
+ */
+struct Snapshot {
+  Snapshot (Database* database,
+            uint32_t id)
+    : database_(database),
+      id_(id),
+      closed_(false),
+      ref_(NULL) {
+    snapshot_ = database->NewSnapshot();
+  }
+
+  ~Snapshot () {
+    assert(closed_);
+  }
+
+  void Attach (napi_ref ref) {
+    ref_ = ref;
+    database_->AttachSnapshot(id_, this);
+  }
+
+  napi_ref Detach () {
+    database_->DetachSnapshot(id_);
+    return ref_;
+  }
+
+  void Close () {
+    if (!closed_) {
+      closed_ = true;
+      database_->ReleaseSnapshot(snapshot_);
+    }
+  }
+
+  Database* database_;
+  uint32_t id_;
+  bool closed_;
+
+  const leveldb::Snapshot* snapshot_;
 
 private:
   napi_ref ref_;
@@ -850,6 +922,13 @@ NAPI_METHOD(db_close) {
     iterator_end_do(env, it->second, noop);
   }
 
+  std::map<uint32_t, Snapshot*> snapshots = database->snapshots_;
+  std::map<uint32_t, Snapshot*>::iterator sn;
+
+  /*for (sn = snapshots.begin(); sn != snapshots.end(); ++sn) {
+    sn->second->Close();
+  }*/
+
   NAPI_RETURN_UNDEFINED();
 }
 
@@ -909,11 +988,13 @@ struct GetWorker final : public PriorityWorker {
              napi_value callback,
              leveldb::Slice key,
              bool asBuffer,
-             bool fillCache)
+             bool fillCache,
+             const leveldb::Snapshot* snapshot)
     : PriorityWorker(env, database, callback, "leveldown.db.get"),
       key_(key),
       asBuffer_(asBuffer) {
     options_.fill_cache = fillCache;
+    options_.snapshot = snapshot;
   }
 
   ~GetWorker () {
@@ -959,7 +1040,27 @@ NAPI_METHOD(db_get) {
   napi_value callback = argv[3];
 
   GetWorker* worker = new GetWorker(env, database, callback, key, asBuffer,
-                                    fillCache);
+                                    fillCache, NULL);
+  worker->Queue();
+
+  NAPI_RETURN_UNDEFINED();
+}
+
+/**
+ * Gets a value from a database.
+ */
+NAPI_METHOD(snapshot_get) {
+  NAPI_ARGV(4);
+  NAPI_SNAPSHOT_CONTEXT();
+
+  leveldb::Slice key = ToSlice(env, argv[1]);
+  napi_value options = argv[2];
+  bool asBuffer = BooleanProperty(env, options, "asBuffer", true);
+  bool fillCache = BooleanProperty(env, options, "fillCache", true);
+  napi_value callback = argv[3];
+
+  GetWorker* worker = new GetWorker(env, snapshot->database_, callback, key, asBuffer,
+                                    fillCache, snapshot->snapshot_);
   worker->Queue();
 
   NAPI_RETURN_UNDEFINED();
@@ -1200,6 +1301,53 @@ NAPI_METHOD(repair_db) {
 }
 
 /**
+ * Runs when a Snapshot is garbage collected.
+ */
+static void FinalizeSnapshot (napi_env env, void* data, void* hint) {
+  if (data) {
+    delete (Snapshot*)data;
+  }
+}
+
+NAPI_METHOD(snapshot_init) {
+  NAPI_ARGV(1);
+  NAPI_DB_CONTEXT();
+
+  uint32_t id = database->currentSnapshotId_++;
+  Snapshot* snapshot = new Snapshot(database, id);
+
+  napi_value result;
+  napi_ref ref;
+  NAPI_STATUS_THROWS(napi_create_external(env, snapshot,
+                                          FinalizeSnapshot,
+                                          NULL, &result));
+
+  // Prevent GC of JS object before the iterator is ended (explicitly or on
+  // db close) and keep track of non-ended iterators to end them on db close.
+  NAPI_STATUS_THROWS(napi_create_reference(env, result, 1, &ref));
+  snapshot->Attach(ref);
+
+  return result;
+}
+
+
+/**
+ * Closes a snapshot
+ */
+NAPI_METHOD(snapshot_close) {
+  NAPI_ARGV(1);
+  NAPI_SNAPSHOT_CONTEXT();
+
+  snapshot->Close();
+  napi_delete_reference(env, snapshot->Detach());
+  // delete snapshot;
+
+  NAPI_RETURN_UNDEFINED();
+}
+
+
+
+/**
  * Runs when an Iterator is garbage collected.
  */
 static void FinalizeIterator (napi_env env, void* data, void* hint) {
@@ -1234,7 +1382,51 @@ NAPI_METHOD(iterator_init) {
   uint32_t id = database->currentIteratorId_++;
   Iterator* iterator = new Iterator(database, id, reverse, keys,
                                     values, limit, lt, lte, gt, gte, fillCache,
-                                    keyAsBuffer, valueAsBuffer, highWaterMark);
+                                    keyAsBuffer, valueAsBuffer, highWaterMark, NULL);
+  napi_value result;
+  napi_ref ref;
+
+  NAPI_STATUS_THROWS(napi_create_external(env, iterator,
+                                          FinalizeIterator,
+                                          NULL, &result));
+
+  // Prevent GC of JS object before the iterator is ended (explicitly or on
+  // db close) and keep track of non-ended iterators to end them on db close.
+  NAPI_STATUS_THROWS(napi_create_reference(env, result, 1, &ref));
+  iterator->Attach(ref);
+
+  return result;
+}
+
+/**
+ * Create an iterator for a snapshot.
+ */
+NAPI_METHOD(snapshot_iterator_init) {
+  NAPI_ARGV(2);
+  NAPI_SNAPSHOT_CONTEXT();
+
+  napi_value options = argv[1];
+  bool reverse = BooleanProperty(env, options, "reverse", false);
+  bool keys = BooleanProperty(env, options, "keys", true);
+  bool values = BooleanProperty(env, options, "values", true);
+  bool fillCache = BooleanProperty(env, options, "fillCache", false);
+  bool keyAsBuffer = BooleanProperty(env, options, "keyAsBuffer", true);
+  bool valueAsBuffer = BooleanProperty(env, options, "valueAsBuffer", true);
+  int limit = Int32Property(env, options, "limit", -1);
+  uint32_t highWaterMark = Uint32Property(env, options, "highWaterMark",
+                                          16 * 1024);
+
+  std::string* lt = RangeOption(env, options, "lt");
+  std::string* lte = RangeOption(env, options, "lte");
+  std::string* gt = RangeOption(env, options, "gt");
+  std::string* gte = RangeOption(env, options, "gte");
+
+  Database* database = snapshot->database_;
+
+  uint32_t id = database->currentIteratorId_++;
+  Iterator* iterator = new Iterator(database, id, reverse, keys,
+                                    values, limit, lt, lte, gt, gte, fillCache,
+                                    keyAsBuffer, valueAsBuffer, highWaterMark, snapshot->snapshot_);
   napi_value result;
   napi_ref ref;
 
@@ -1705,6 +1897,11 @@ NAPI_INIT() {
 
   NAPI_EXPORT_FUNCTION(destroy_db);
   NAPI_EXPORT_FUNCTION(repair_db);
+
+  NAPI_EXPORT_FUNCTION(snapshot_init);
+  NAPI_EXPORT_FUNCTION(snapshot_close);
+  NAPI_EXPORT_FUNCTION(snapshot_get);
+  NAPI_EXPORT_FUNCTION(snapshot_iterator_init);
 
   NAPI_EXPORT_FUNCTION(iterator_init);
   NAPI_EXPORT_FUNCTION(iterator_seek);

@@ -1,5 +1,5 @@
 {
-  "name": "leveldown",
+  "name": "@ninox/leveldown",
   "version": "6.0.0",
   "description": "A low-level Node.js LevelDB binding",
   "license": "MIT",
@@ -7,6 +7,7 @@
   "scripts": {
     "install": "node-gyp-build",
     "test": "standard && (nyc -s tape test/*-test.js | faucet) && nyc report",
+    "fix": "standard --fix",
     "test-gc": "node --expose-gc test/gc.js",
     "test-electron": "electron test/electron.js",
     "test-prebuild": "cross-env PREBUILDS_ONLY=1 npm t",
@@ -24,11 +25,11 @@
     "prebuild-darwin-x64": "prebuildify -t 8.14.0 --napi --strip"
   },
   "dependencies": {
-    "abstract-leveldown": "^7.0.0",
     "napi-macros": "~2.0.0",
     "node-gyp-build": "~4.2.1"
   },
   "devDependencies": {
+    "abstract-leveldown": "^7.2.0",
     "async-each": "^1.0.3",
     "coveralls": "^3.0.2",
     "cross-env": "^7.0.3",
@@ -59,7 +60,7 @@
   "gypfile": true,
   "repository": {
     "type": "git",
-    "url": "https://github.com/Level/leveldown.git"
+    "url": "git@github.com:ninoxdb/leveldown.git"
   },
   "homepage": "https://github.com/Level/leveldown",
   "keywords": [

@@ -1,15 +1,18 @@
 'use strict'
 
 const util = require('util')
-const AbstractChainedBatch = require('abstract-leveldown').AbstractChainedBatch
 const binding = require('./binding')
+const AbstractChainedBatch = require('./abstract-chained-batch')
 
 function ChainedBatch (db) {
   AbstractChainedBatch.call(this, db)
   this.context = binding.batch_init(db.context)
 }
 
+util.inherits(ChainedBatch, AbstractChainedBatch)
+
 ChainedBatch.prototype._put = function (key, value) {
+  console.log('ChainedBatch._put', key, value)
   binding.batch_put(this.context, key, value)
 }
 
@@ -24,7 +27,5 @@ ChainedBatch.prototype._clear = function () {
 ChainedBatch.prototype._write = function (options, callback) {
   binding.batch_write(this.context, options, callback)
 }
-
-util.inherits(ChainedBatch, AbstractChainedBatch)
 
 module.exports = ChainedBatch

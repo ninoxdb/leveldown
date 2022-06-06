@@ -1,21 +1,22 @@
 'use strict'
 
 const util = require('util')
-const AbstractLevelDOWN = require('abstract-leveldown').AbstractLevelDOWN
+const AbstractLevelDOWN = require('./abstract-leveldown')
 const binding = require('./binding')
 const ChainedBatch = require('./chained-batch')
 const Iterator = require('./iterator')
+const Snapshot = require('./snapshot')
 
-function LevelDOWN (location) {
+function LevelDOWN (location, options) {
   if (!(this instanceof LevelDOWN)) {
-    return new LevelDOWN(location)
+    return new LevelDOWN(location, options)
   }
 
   if (typeof location !== 'string') {
     throw new Error('constructor requires a location string argument')
   }
 
-  AbstractLevelDOWN.call(this, {
+  AbstractLevelDOWN.call(this, location, {
     bufferKeys: true,
     snapshots: true,
     permanence: true,
@@ -26,7 +27,8 @@ function LevelDOWN (location) {
     additionalMethods: {
       approximateSize: true,
       compactRange: true
-    }
+    },
+    ...options
   })
 
   this.location = location
@@ -70,6 +72,27 @@ LevelDOWN.prototype._chainedBatch = function () {
 LevelDOWN.prototype._batch = function (operations, options, callback) {
   binding.batch_do(this.context, operations, options, callback)
 }
+
+/* LevelDOWN.prototype.createBatch = function (options) {
+  const batch = binding.batch_init(this.context);
+  return {
+    put: (key, value) => {
+      key = this._serializeKey(key)
+      value = this._serializeValue(value)
+      binding.batch_put(batch, key, value);
+    },
+    del: (key) => {
+      key = this._serializeKey(key)
+      binding.batch_del(batch, key);
+    },
+    clear: () => {
+      binding.batch_clear(batch);
+    },
+    write: (callback) => {
+      binding.batch_write(batch, options, callback);
+    }
+  }
+} */
 
 LevelDOWN.prototype.approximateSize = function (start, end, callback) {
   if (start == null ||
@@ -122,6 +145,15 @@ LevelDOWN.prototype._iterator = function (options) {
   }
 
   return new Iterator(this, options)
+}
+
+LevelDOWN.prototype.snapshot = function (options) {
+  if (this.status !== 'open') {
+    // Prevent segfault
+    throw new Error('cannot call iterator() before open()')
+  }
+
+  return new Snapshot(this, options)
 }
 
 LevelDOWN.destroy = function (location, callback) {
