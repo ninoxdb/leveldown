@@ -12,7 +12,6 @@ function ChainedBatch (db) {
 util.inherits(ChainedBatch, AbstractChainedBatch)
 
 ChainedBatch.prototype._put = function (key, value) {
-  console.log('ChainedBatch._put', key, value)
   binding.batch_put(this.context, key, value)
 }
 
