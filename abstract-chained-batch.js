@@ -21,7 +21,6 @@ AbstractChainedBatch.prototype._checkWritten = function () {
 }
 
 AbstractChainedBatch.prototype.put = function (key, value) {
-  console.log('AbstractChainedBatch.put', JSON.stringify(key), JSON.stringify(value))
   this._checkWritten()
 
   const err = this._db._checkKey(key, 'key')
